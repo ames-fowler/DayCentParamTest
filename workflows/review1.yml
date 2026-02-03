@@ -1,0 +1,261 @@
+name: Review-1 (metadata + upload + register)
+
+on:
+  pull_request:
+    types: [labeled]
+
+jobs:
+  review1:
+    if: github.event.label.name == 'review-1'
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      pull-requests: write
+
+    env:
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+
+    steps:
+      - name: Checkout PR
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq uuid-runtime
+          python -m pip install --upgrade pip
+          python -m pip install supabase==2.6.0
+
+      - name: Configure AWS credentials for R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          aws configure set aws_access_key_id "$AWS_ACCESS_KEY_ID"
+          aws configure set aws_secret_access_key "$AWS_SECRET_ACCESS_KEY"
+          aws configure set default.region "auto"
+
+      - name: Locate incoming submission files
+        id: locate
+        run: |
+          set -euo pipefail
+
+          # Expect exactly one submission per PR for v1
+          # Find metadata.json and crop.100 under incoming/**/
+          META=$(find incoming -type f -name "metadata.json" | head -n 1 || true)
+          CROP=$(find incoming -type f -name "crop.100" | head -n 1 || true)
+
+          if [[ -z "$META" || -z "$CROP" ]]; then
+            echo "ERROR: Expected files not found. Require:"
+            echo "  incoming/<crop_code>/<version_tag>/metadata.json"
+            echo "  incoming/<crop_code>/<version_tag>/crop.100"
+            exit 1
+          fi
+
+          # Parse crop_code and version_tag from path: incoming/<crop_code>/<version_tag>/file
+          # e.g. incoming/CORN/v1/metadata.json
+          CROP_CODE=$(echo "$META" | awk -F'/' '{print $2}')
+          VERSION_TAG=$(echo "$META" | awk -F'/' '{print $3}')
+
+          if [[ -z "$CROP_CODE" || -z "$VERSION_TAG" ]]; then
+            echo "ERROR: Could not parse crop_code/version_tag from path: $META"
+            exit 1
+          fi
+
+          echo "meta_path=$META" >> $GITHUB_OUTPUT
+          echo "crop_path=$CROP" >> $GITHUB_OUTPUT
+          echo "crop_code=$CROP_CODE" >> $GITHUB_OUTPUT
+          echo "version_tag=$VERSION_TAG" >> $GITHUB_OUTPUT
+
+      - name: Validate extensions + sizes (strict v1)
+        run: |
+          set -euo pipefail
+          META="${{ steps.locate.outputs.meta_path }}"
+          CROP="${{ steps.locate.outputs.crop_path }}"
+
+          # Allowed extensions
+          [[ "$META" == *.json ]] || (echo "metadata.json must be .json" && exit 1)
+          [[ "$CROP" == *.100  ]] || (echo "crop.100 must be .100" && exit 1)
+
+          # Max sizes (bytes) - adjust if you want
+          MAX_META=262144      # 256 KB
+          MAX_CROP=1048576     # 1 MB
+
+          META_SIZE=$(stat -c%s "$META")
+          CROP_SIZE=$(stat -c%s "$CROP")
+
+          if (( META_SIZE > MAX_META )); then
+            echo "metadata.json too large: $META_SIZE > $MAX_META"
+            exit 1
+          fi
+
+          if (( CROP_SIZE > MAX_CROP )); then
+            echo "crop.100 too large: $CROP_SIZE > $MAX_CROP"
+            exit 1
+          fi
+
+      - name: Generate submission_id and compute hashes
+        id: hash
+        run: |
+          set -euo pipefail
+          META="${{ steps.locate.outputs.meta_path }}"
+          CROP="${{ steps.locate.outputs.crop_path }}"
+
+          SUBMISSION_ID=$(uuidgen | tr '[:upper:]' '[:lower:]')
+
+          META_SHA=$(sha256sum "$META" | awk '{print $1}')
+          CROP_SHA=$(sha256sum "$CROP" | awk '{print $1}')
+
+          META_BYTES=$(stat -c%s "$META")
+          CROP_BYTES=$(stat -c%s "$CROP")
+
+          echo "submission_id=$SUBMISSION_ID" >> $GITHUB_OUTPUT
+          echo "meta_sha=$META_SHA" >> $GITHUB_OUTPUT
+          echo "crop_sha=$CROP_SHA" >> $GITHUB_OUTPUT
+          echo "meta_bytes=$META_BYTES" >> $GITHUB_OUTPUT
+          echo "crop_bytes=$CROP_BYTES" >> $GITHUB_OUTPUT
+
+      - name: Upload artifacts to R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          META="${{ steps.locate.outputs.meta_path }}"
+          CROP="${{ steps.locate.outputs.crop_path }}"
+          SUBMISSION_ID="${{ steps.hash.outputs.submission_id }}"
+
+          ENDPOINT="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+
+          aws s3 cp "$CROP" "s3://${R2_BUCKET}/submissions/${SUBMISSION_ID}/crop.100" \
+            --endpoint-url "$ENDPOINT" \
+            --content-type "text/plain"
+
+          aws s3 cp "$META" "s3://${R2_BUCKET}/submissions/${SUBMISSION_ID}/metadata.json" \
+            --endpoint-url "$ENDPOINT" \
+            --content-type "application/json"
+
+      - name: Register submission + artifacts in Supabase
+        env:
+          CROP_CODE: ${{ steps.locate.outputs.crop_code }}
+          VERSION_TAG: ${{ steps.locate.outputs.version_tag }}
+          SUBMISSION_ID: ${{ steps.hash.outputs.submission_id }}
+          META_SHA: ${{ steps.hash.outputs.meta_sha }}
+          CROP_SHA: ${{ steps.hash.outputs.crop_sha }}
+          META_BYTES: ${{ steps.hash.outputs.meta_bytes }}
+          CROP_BYTES: ${{ steps.hash.outputs.crop_bytes }}
+        run: |
+          set -euo pipefail
+
+          # Read JSON metadata content as jsonb payload
+          META_PATH="${{ steps.locate.outputs.meta_path }}"
+          META_JSON=$(cat "$META_PATH" | jq -c '.')
+
+          python - << 'PY'
+          import os, json
+          from supabase import create_client
+
+          url = os.environ["SUPABASE_URL"]
+          key = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
+          sb = create_client(url, key)
+
+          crop_code = os.environ["CROP_CODE"]
+          version_tag = os.environ["VERSION_TAG"]
+          submission_id = os.environ["SUBMISSION_ID"]
+
+          meta_json = json.loads(os.environ.get("META_JSON", "{}")) if False else None
+          # We'll pass metadata_json as raw JSON string from env via a safer method below.
+          PY
+          PY
+          # NOTE: We'll pass META_JSON via stdin to avoid env quoting issues.
+          PYTHON_CODE=$(cat <<'PY'
+          import os, sys, json
+          from supabase import create_client
+
+          url = os.environ["SUPABASE_URL"]
+          key = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
+          sb = create_client(url, key)
+
+          crop_code = os.environ["CROP_CODE"]
+          version_tag = os.environ["VERSION_TAG"]
+          submission_id = os.environ["SUBMISSION_ID"]
+
+          meta_json = json.loads(sys.stdin.read())
+
+          # 1) Insert/Upsert submission
+          submission = {
+              "submission_id": submission_id,
+              "crop_code": crop_code,
+              "version_tag": version_tag,
+              "status": "metadata_passed",
+              "metadata_json": meta_json,
+              "metadata_schema_version": "v1",
+              "provenance": {
+                  "source": "github-pr",
+                  "repo": os.environ.get("GITHUB_REPOSITORY"),
+                  "pr": os.environ.get("GITHUB_REF_NAME")
+              }
+          }
+
+          # Use upsert to be idempotent
+          sb.table("submissions").upsert(submission).execute()
+
+          # 2) Insert artifacts
+          r2_bucket = os.environ["R2_BUCKET"]
+          artifacts = [
+              {
+                  "submission_id": submission_id,
+                  "artifact_type": "crop_100",
+                  "r2_bucket": r2_bucket,
+                  "r2_key": f"submissions/{submission_id}/crop.100",
+                  "sha256": os.environ["CROP_SHA"],
+                  "content_type": "text/plain",
+                  "bytes": int(os.environ["CROP_BYTES"]),
+              },
+              {
+                  "submission_id": submission_id,
+                  "artifact_type": "metadata",
+                  "r2_bucket": r2_bucket,
+                  "r2_key": f"submissions/{submission_id}/metadata.json",
+                  "sha256": os.environ["META_SHA"],
+                  "content_type": "application/json",
+                  "bytes": int(os.environ["META_BYTES"]),
+              },
+          ]
+          sb.table("artifacts").insert(artifacts).execute()
+
+          print(submission_id)
+          PY
+          )
+
+          echo "$META_JSON" | python -c "$PYTHON_CODE"
+
+      - name: Comment PR with submission_id
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const submissionId = '${{ steps.hash.outputs.submission_id }}';
+            const cropCode = '${{ steps.locate.outputs.crop_code }}';
+            const versionTag = '${{ steps.locate.outputs.version_tag }}';
+            const body = [
+              `✅ Review-1 complete.`,
+              ``,
+              `Submission ID: \`${submissionId}\``,
+              `Crop: \`${cropCode}\``,
+              `Version: \`${versionTag}\``,
+              ``,
+              `Uploaded to R2:`,
+              `- submissions/${submissionId}/crop.100`,
+              `- submissions/${submissionId}/metadata.json`
+            ].join('\n');
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body
+            });
