@@ -1,0 +1,6 @@
+R2 bucket: params
+
+submissions/{submission_id}/crop.100
+submissions/{submission_id}/metadata.json
+benchmarks/{submission_id}/{run_id}/summary.json
+benchmarks/{submission_id}/{run_id}/outputs.zip
