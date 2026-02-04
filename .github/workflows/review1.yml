@@ -139,40 +139,25 @@ jobs:
             --endpoint-url "$ENDPOINT" \
             --content-type "application/json"
 
-      - name: Register submission + artifacts in Supabase
+            - name: Register submission + artifacts in Supabase
         env:
           CROP_CODE: ${{ steps.locate.outputs.crop_code }}
           VERSION_TAG: ${{ steps.locate.outputs.version_tag }}
           SUBMISSION_ID: ${{ steps.hash.outputs.submission_id }}
+          META_PATH: ${{ steps.locate.outputs.meta_path }}
           META_SHA: ${{ steps.hash.outputs.meta_sha }}
           CROP_SHA: ${{ steps.hash.outputs.crop_sha }}
           META_BYTES: ${{ steps.hash.outputs.meta_bytes }}
           CROP_BYTES: ${{ steps.hash.outputs.crop_bytes }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           set -euo pipefail
 
-          # Read JSON metadata content as jsonb payload
-          META_PATH="${{ steps.locate.outputs.meta_path }}"
-          META_JSON=$(cat "$META_PATH" | jq -c '.')
-
-          python - << 'PY'
-          import os, json
-          from supabase import create_client
-
-          url = os.environ["SUPABASE_URL"]
-          key = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
-          sb = create_client(url, key)
-
-          crop_code = os.environ["CROP_CODE"]
-          version_tag = os.environ["VERSION_TAG"]
-          submission_id = os.environ["SUBMISSION_ID"]
-
-          meta_json = json.loads(os.environ.get("META_JSON", "{}")) if False else None
-          # We'll pass metadata_json as raw JSON string from env via a safer method below.
-          PY
-          PY
-          # NOTE: We'll pass META_JSON via stdin to avoid env quoting issues.
-          PYTHON_CODE=$(cat <<'PY'
+          python - <<'PY'
           import os, sys, json
           from supabase import create_client
 
@@ -183,53 +168,65 @@ jobs:
           crop_code = os.environ["CROP_CODE"]
           version_tag = os.environ["VERSION_TAG"]
           submission_id = os.environ["SUBMISSION_ID"]
+          r2_bucket = os.environ["R2_BUCKET"]
 
-          meta_json = json.loads(sys.stdin.read())
+          meta_sha = os.environ["META_SHA"]
+          crop_sha = os.environ["CROP_SHA"]
+          meta_bytes = int(os.environ["META_BYTES"])
+          crop_bytes = int(os.environ["CROP_BYTES"])
 
-          # 1) Insert/Upsert submission
+          repo = os.environ.get("GITHUB_REPOSITORY")
+          pr_number = os.environ.get("PR_NUMBER")
+
+          # Read metadata JSON from file
+          meta_path = os.environ["META_PATH"]
+          with open(meta_path, "r", encoding="utf-8") as f:
+            metadata_json = json.load(f)
+
+          # 1) Upsert submission (public after Review-1)
           submission = {
-              "submission_id": submission_id,
-              "crop_code": crop_code,
-              "version_tag": version_tag,
-              "status": "metadata_passed",
-              "metadata_json": meta_json,
-              "metadata_schema_version": "v1",
-              "provenance": {
-                  "source": "github-pr",
-                  "repo": os.environ.get("GITHUB_REPOSITORY"),
-                  "pr": os.environ.get("GITHUB_REF_NAME")
-              }
+            "submission_id": submission_id,
+            "crop_code": crop_code,
+            "version_tag": version_tag,
+            "status": "metadata_passed",
+            "metadata_json": metadata_json,
+            "metadata_schema_version": "v1",
+            "provenance": {
+              "source": "github-pr",
+              "repo": repo,
+              "pr_number": pr_number
+            }
           }
 
-          # Use upsert to be idempotent
           sb.table("submissions").upsert(submission).execute()
 
-          # 2) Insert artifacts
-          r2_bucket = os.environ["R2_BUCKET"]
+          # 2) Insert artifact records
           artifacts = [
-              {
-                  "submission_id": submission_id,
-                  "artifact_type": "crop_100",
-                  "r2_bucket": r2_bucket,
-                  "r2_key": f"submissions/{submission_id}/crop.100",
-                  "sha256": os.environ["CROP_SHA"],
-                  "content_type": "text/plain",
-                  "bytes": int(os.environ["CROP_BYTES"]),
-              },
-              {
-                  "submission_id": submission_id,
-                  "artifact_type": "metadata",
-                  "r2_bucket": r2_bucket,
-                  "r2_key": f"submissions/{submission_id}/metadata.json",
-                  "sha256": os.environ["META_SHA"],
-                  "content_type": "application/json",
-                  "bytes": int(os.environ["META_BYTES"]),
-              },
+            {
+              "submission_id": submission_id,
+              "artifact_type": "crop_100",
+              "r2_bucket": r2_bucket,
+              "r2_key": f"submissions/{submission_id}/crop.100",
+              "sha256": crop_sha,
+              "content_type": "text/plain",
+              "bytes": crop_bytes,
+            },
+            {
+              "submission_id": submission_id,
+              "artifact_type": "metadata",
+              "r2_bucket": r2_bucket,
+              "r2_key": f"submissions/{submission_id}/metadata.json",
+              "sha256": meta_sha,
+              "content_type": "application/json",
+              "bytes": meta_bytes,
+            }
           ]
+
           sb.table("artifacts").insert(artifacts).execute()
 
-          print(submission_id)
+          print("Registered submission:", submission_id)
           PY
+
           )
 
           echo "$META_JSON" | python -c "$PYTHON_CODE"
