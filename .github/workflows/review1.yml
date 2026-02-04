@@ -139,7 +139,7 @@ jobs:
             --endpoint-url "$ENDPOINT" \
             --content-type "application/json"
 
-            - name: Register submission + artifacts in Supabase
+      - name: Register submission + artifacts in Supabase
         env:
           CROP_CODE: ${{ steps.locate.outputs.crop_code }}
           VERSION_TAG: ${{ steps.locate.outputs.version_tag }}
