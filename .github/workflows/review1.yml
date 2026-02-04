@@ -141,6 +141,7 @@ jobs:
 
       - name: Register submission + artifacts in Supabase
         env:
+          GITHUB_ACTOR: ${{ github.actor }}
           CROP_CODE: ${{ steps.locate.outputs.crop_code }}
           VERSION_TAG: ${{ steps.locate.outputs.version_tag }}
           SUBMISSION_ID: ${{ steps.hash.outputs.submission_id }}
@@ -191,12 +192,11 @@ jobs:
             "status": "metadata_passed",
             "metadata_json": metadata_json,
             "metadata_schema_version": "v1",
-            "provenance": {
-              "source": "github-pr",
-              "repo": repo,
-              "pr_number": pr_number
-            }
+            "submitted_by_login": os.environ.get("GITHUB_ACTOR"),
+            "submitted_via": "github",
+            "provenance": {"source": "github-pr", "repo": repo, "pr_number": pr_number}
           }
+
 
           sb.table("submissions").upsert(submission).execute()
 
