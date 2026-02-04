@@ -227,8 +227,6 @@ jobs:
           print("Registered submission:", submission_id)
           PY
 
-          )
-
           echo "$META_JSON" | python -c "$PYTHON_CODE"
 
       - name: Comment PR with submission_id
